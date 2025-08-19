@@ -1,473 +1,756 @@
-"""
-3Sigma Partners - Wealth Manager Portfolio Dashboard (CAS PDF + CSV/XLSX)
-============================================================================
-Single-file Streamlit app tailored for advisers. It:
-- **Parses CAMS/KFintech CAS PDFs** via `casparser` (supports password)
-- Also accepts **CSV/XLSX** transaction exports (brokers/MF statements)
-- Computes **XIRR** per holding & portfolio, optional **TWR** when price history is available
-- Deep-dive analytics: **allocation (asset/sector/mcap)**, **concentration & HHI**, **top/bottom contributors**, **cashflow timeline**, **rolling returns**, **drawdowns**, **realized P&L**
-- **Benchmark comparison**: Nifty 50, Next 50, Midcap, Smallcap (via yfinance)
-- **Export** branded **Excel** & **PDF** reports, with **Advisor Notes** section
+# 3Sigma Partners — CAS Portfolio Analytics Dashboard
+# -------------------------------------------------
+# Streamlit app that lets a user upload a CAS (CSV/XLSX/PDF*),
+# builds a clean transaction ledger, and renders a multi-tab dashboard
+# with XIRR, benchmark comparisons (NIFTY 500/50/MID/SMALL),
+# allocations (sector, market-cap), risk, and diagnostics.
+#
+# *PDF parsing for CAMS/KFin CAS is best-effort (layout varies). For reliability,
+#  prefer CSV/XLSX exported ledgers. A sample template is auto-generated below.
+#
+# HOW TO RUN
+#   1) pip install -r requirements.txt
+#   2) streamlit run app.py
+#
+# requirements.txt (suggested)
+#   streamlit
+#   pandas
+#   numpy
+#   plotly
+#   yfinance
+#   python-dateutil
+#   pdfminer.six
+#   openpyxl
+#   scipy
+#
+# Color palette: Blue, Grey, Gold (no overlapping hues per chart)
+# ---------------------------------------------------------------
 
-Run:
-    streamlit run 3Sigma_Partners_portfolio_dashboard.py
-
-Install (recommended):
-    pip install -U streamlit pandas numpy matplotlib plotly xlsxwriter openpyxl yfinance casparser reportlab
-
-Notes:
-- CAS PDFs are often **password protected** (PAN in uppercase without spaces, or per AMC/email). Provide it in the sidebar when uploading a PDF.
-- Price/TWR/benchmark charts need internet + `yfinance` to fetch series.
-- The CSV/XLSX parser is schema-agnostic with best-effort column inference; adjust `COLUMN_ALIASES` to your file if needed.
-"""
-
-import streamlit as st
-import pandas as pd
-import numpy as np
 import io
-from datetime import datetime
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
+import re
+import math
+import json
+import base64
+import warnings
+from datetime import datetime, timedelta, date
+
+import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dataclasses import dataclass
+import streamlit as st
 
-# Optional deps
+from dateutil.relativedelta import relativedelta
+
 try:
     import yfinance as yf
-    YFINANCE_AVAILABLE = True
 except Exception:
-    YFINANCE_AVAILABLE = False
+    yf = None
 
-try:
-    from casparser import read_cas_pdf
-    CASPARSER_AVAILABLE = True
-except Exception:
-    CASPARSER_AVAILABLE = False
+warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="3Sigma Partners - Portfolio Dashboard", layout="wide")
+# -----------------------
+# App-wide configuration
+# -----------------------
+st.set_page_config(
+    page_title="3Sigma CAS Portfolio Dashboard",
+    page_icon="📈",
+    layout="wide",
+)
 
-# ============================== Config ===============================
-BRAND = "3Sigma Partners"
-RISK_FREE_DEFAULT = 0.055  # 5.5% annual for Sharpe calc (editable in UI)
+# Brand styling
+PRIMARY_BLUE = "#0B5FA5"
+SECONDARY_BLUE = "#2E86C1"
+SOFT_BLUE = "#E8F1FA"
+DARK_GREY = "#2B2F36"
+MID_GREY = "#6B7280"
+LIGHT_GREY = "#EEF2F7"
+GOLD = "#C8A951"
+GOLD_SOFT = "#F7F2E0"
 
-COLUMN_ALIASES = {
-    'date': ['date', 'transaction date', 'trade date', 'settlement date', 'value date'],
-    'security': ['security', 'scheme', 'scheme name', 'name', 'scrip', 'symbol', 'description'],
-    'type': ['type', 'tran type', 'transaction type', 'buy/sell', 'buy sell', 'txn'],
-    'quantity': ['quantity', 'qty', 'no. of units', 'units', 'shares'],
-    'price': ['price', 'rate', 'nav', 'trade price'],
-    'amount': ['amount', 'value', 'transaction value', 'net amount', 'gross amount'],
-    'isin': ['isin'],
-    'sector': ['sector'],
-    'mcap': ['marketcap', 'market cap', 'marketcapcategory', 'market cap category', 'mcap']
+BG_CARD = "#FFFFFF"
+
+# Plotly theme helpers
+px.defaults.template = "plotly_white"
+
+COLOR_SETS = {
+    "line": [PRIMARY_BLUE, GOLD, MID_GREY, SECONDARY_BLUE],
+    "bars": [PRIMARY_BLUE, GOLD, MID_GREY, SECONDARY_BLUE, "#5DADE2", "#B7950B"],
+    "pie": [PRIMARY_BLUE, GOLD, MID_GREY, SECONDARY_BLUE, "#4F6D7A", "#D4AF37"],
 }
 
-# ============================== Helpers =============================
+# -----------------------
+# Utility: Sample Template
+# -----------------------
+SAMPLE_COLUMNS = [
+    "Date", "Folio", "Scheme", "Transaction", "Amount", "Units", "NAV",
+    "ISIN", "AMC", "Sector", "MarketCap", "CurrentValue"
+]
 
-def map_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c.lower() for c in df.columns]
-    def pick(options):
-        for o in options:
-            if o in cols:
-                return df.columns[cols.index(o)]
-        return None
-    out = pd.DataFrame()
-    out['Date'] = pd.to_datetime(df[pick(COLUMN_ALIASES['date'])]) if pick(COLUMN_ALIASES['date']) else pd.NaT
-    out['Security'] = df[pick(COLUMN_ALIASES['security'])] if pick(COLUMN_ALIASES['security']) else np.nan
-    out['Type'] = df[pick(COLUMN_ALIASES['type'])].astype(str).str.upper() if pick(COLUMN_ALIASES['type']) else ""
-    out['Quantity'] = pd.to_numeric(df[pick(COLUMN_ALIASES['quantity'])], errors='coerce') if pick(COLUMN_ALIASES['quantity']) else 0.0
-    out['Price'] = pd.to_numeric(df[pick(COLUMN_ALIASES['price'])], errors='coerce') if pick(COLUMN_ALIASES['price']) else np.nan
-    out['Amount'] = pd.to_numeric(df[pick(COLUMN_ALIASES['amount'])], errors='coerce') if pick(COLUMN_ALIASES['amount']) else np.nan
-    out['ISIN'] = df[pick(COLUMN_ALIASES['isin'])] if pick(COLUMN_ALIASES['isin']) else ""
-    out['Sector'] = df[pick(COLUMN_ALIASES['sector'])] if pick(COLUMN_ALIASES['sector']) else ""
-    out['MarketCapCategory'] = df[pick(COLUMN_ALIASES['mcap'])] if pick(COLUMN_ALIASES['mcap']) else ""
-    return out
+SAMPLE_ROWS = [
+    ["2021-01-05", "1234/56", "Nippon India Nifty 50", "Purchase", 100000, 500.0, 200.00, "INF204KB14I2", "Nippon", "Large Cap", "Large", None],
+    ["2021-03-10", "1234/56", "Nippon India Nifty 50", "Purchase", 50000, 220.0, 227.27, "INF204KB14I2", "Nippon", "Large Cap", "Large", None],
+    ["2022-07-18", "1234/57", "HDFC Midcap Opportunities", "Purchase", 75000, 300.0, 250.00, "INF179K01DN8", "HDFC", "Mid Cap", "Mid", None],
+    ["2023-02-01", "1234/57", "HDFC Midcap Opportunities", "Dividend Reinvest", 2500, 10.0, 250.00, "INF179K01DN8", "HDFC", "Mid Cap", "Mid", None],
+    ["2024-06-20", "1234/58", "Axis Small Cap", "Purchase", 60000, 240.0, 250.00, "INF846K01136", "Axis", "Small Cap", "Small", None],
+]
 
+# -----------------------
+# Helper functions
+# -----------------------
 
-def parse_upload(upload, password: str | None):
-    """Return a canonical transaction DataFrame with columns:
-    Date, Security, Type, Quantity, Price, Amount, ISIN, Sector, MarketCapCategory
-    Supports PDF (CAS) via casparser and CSV/XLSX generically.
-    """
-    if upload is None:
-        return None, {}
-    name = upload.name.lower()
-    meta = {}
-
-    if name.endswith('.pdf'):
-        if not CASPARSER_AVAILABLE:
-            st.error("CAS PDF detected but `casparser` is not installed. Run: pip install casparser")
-            return None, meta
+def _to_date(x):
+    if pd.isna(x):
+        return pd.NaT
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y"):
         try:
-            content = upload.read()
-            result = read_cas_pdf(content, password=password or "")
-            # result is a dict with keys like 'transactions', 'folios', 'investor_info'
-            txns = result.get('transactions', [])
-            meta['investor'] = result.get('investor_info', {})
-            if len(txns) == 0:
-                st.error("CAS parsed but found no transactions. Check password or file contents.")
-                return None, meta
-            df = pd.DataFrame(txns)
-            # Common casparser fields: date, scheme, folio, txn_type, units, nav, amount
-            rename_map = {
-                'date': 'Date', 'scheme': 'Security', 'txn_type': 'Type',
-                'units': 'Quantity', 'nav': 'Price', 'amount': 'Amount', 'isin': 'ISIN'
-            }
-            for k, v in rename_map.items():
-                if k in df.columns:
-                    df[v] = df[k]
-            # Standardize types
-            df['Date'] = pd.to_datetime(df['Date'])
-            df['Type'] = df['Type'].astype(str).str.upper()
-            for c in ['Quantity','Price','Amount']:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
-            df['Sector'] = ""  # CAS doesn't include sector
-            df['MarketCapCategory'] = ""  # not in CAS
-            txn = df[['Date','Security','Type','Quantity','Price','Amount','ISIN','Sector','MarketCapCategory']]
-            return txn, meta
-        except Exception as e:
-            st.exception(e)
-            return None, meta
-
-    # CSV/XLSX
-    try:
-        if name.endswith('.csv'):
-            raw = pd.read_csv(upload)
-        else:
-            raw = pd.read_excel(upload)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        return None, meta
-    txn = map_columns(raw)
-    return txn, meta
-
-
-# Financial utilities -------------------------------------------------
-
-def xnpv(rate, cashflows):
-    if rate <= -1.0:
-        return np.inf
-    t0 = cashflows[0][0]
-    return sum(cf/((1+rate)**((d - t0).days/365.0)) for d, cf in cashflows)
-
-
-def xirr(cashflows, guess=0.1, tol=1e-6, maxiter=100):
-    if len(cashflows) == 0:
-        return np.nan
-    try:
-        r = guess
-        for _ in range(maxiter):
-            f = xnpv(r, cashflows)
-            d = (xnpv(r+1e-6, cashflows)-f)/1e-6
-            if d == 0:
-                break
-            r2 = r - f/d
-            if abs(r2 - r) < tol:
-                return r2
-            r = r2
-        return r
-    except Exception:
-        return np.nan
-
-
-def build_cashflows(txn: pd.DataFrame, security: str | None=None):
-    df = txn if security is None else txn[txn['Security'] == security]
-    df = df.sort_values('Date')
-    flows = []
-    for _, r in df.iterrows():
-        amt = r['Amount']
-        if pd.isna(amt):
-            if not pd.isna(r.get('Quantity')) and not pd.isna(r.get('Price')):
-                amt = (r['Quantity'] * r['Price'])
-            else:
-                amt = 0.0
-        # Convention: BUY -> negative, SELL -> positive
-        t = str(r.get('Type','')).upper()
-        if t.startswith('BUY') or t in ('PURCHASE','ADDITIONAL PURCHASE','REINVEST','NEW PURCHASE'):
-            amt = -abs(amt)
-        elif t.startswith('SELL') or t in ('REDEMPTION','SWITCH OUT'):
-            amt = abs(amt)
-        flows.append((pd.to_datetime(r['Date']).to_pydatetime(), float(amt)))
-    return flows
-
-
-def holdings_from_txn(txn: pd.DataFrame) -> pd.DataFrame:
-    h = txn.groupby('Security').agg({
-        'Quantity': 'sum',
-        'Amount': 'sum'
-    }).rename(columns={'Quantity':'NetQuantity','Amount':'NetAmount'}).reset_index()
-    h['NetQuantity'] = h['NetQuantity'].fillna(0.0)
-    return h
-
-
-def concentration_metrics(weights: pd.Series) -> dict:
-    w = weights.fillna(0).values
-    hhi = (w**2).sum()  # Herfindahl-Hirschman
-    top1 = float(np.max(w)) if len(w)>0 else 0.0
-    top3 = float(np.sort(w)[-3:].sum()) if len(w)>=3 else float(np.sort(w).sum())
-    return {'HHI': hhi, 'Top1': top1, 'Top3': top3}
-
-
-def drawdown(series: pd.Series) -> pd.DataFrame:
-    cummax = series.cummax()
-    dd = (series/cummax - 1.0)
-    return pd.DataFrame({'value': series, 'peak': cummax, 'drawdown': dd})
-
-
-# ============================== UI =================================
-st.title(f"{BRAND} — Wealth Manager Portfolio Dashboard")
-
-with st.sidebar:
-    st.header("Upload & Settings")
-    up = st.file_uploader("Upload CAS PDF / CSV / XLSX", type=["pdf","csv","xlsx","xls"]) 
-    cas_pwd = st.text_input("CAS PDF Password (if any)", type="password")
-    st.caption("CAS password is typically PAN in uppercase without spaces, unless changed by you.")
-
-    st.markdown("---")
-    st.subheader("Benchmarks & Risk-Free")
-    enable_online = st.checkbox("Enable online price fetch (yfinance)", value=True)
-    benchmark_nifty = st.text_input("Nifty 50 ticker", value="^NSEI")
-    benchmark_next50 = st.text_input("Nifty Next 50 ticker", value="NIFTY_NEXT50.NS")
-    benchmark_mid = st.text_input("Nifty Midcap ticker", value="NIFTY_MIDCAP.NS")
-    benchmark_small = st.text_input("Nifty Smallcap ticker", value="NIFTY_SMALLCAP.NS")
-    rf_rate = st.number_input("Risk-free (annual, for Sharpe)", min_value=0.0, max_value=1.0, value=RISK_FREE_DEFAULT, step=0.005, format="%0.3f")
-
-    st.markdown("---")
-    st.subheader("Report Options")
-    include_price_charts = st.checkbox("Include price charts in PDF", value=True)
-    advisor_notes = st.text_area("Advisor Notes (included in PDF)")
-
-# Parse upload
-if up is None:
-    st.info("Upload your CAS PDF or a CSV/XLSX transactions file to begin.")
-    st.stop()
-
-txn, meta = parse_upload(up, cas_pwd)
-if txn is None or len(txn)==0:
-    st.stop()
-
-# Preview
-st.success("File parsed successfully.")
-with st.expander("Preview parsed transactions", expanded=False):
-    st.dataframe(txn.head(50))
-
-# ---------------- Summary KPIs ----------------
-# Holdings and XIRR
-hold = holdings_from_txn(txn)
-
-rows = []
-for s in txn['Security'].dropna().unique():
-    cf = build_cashflows(txn, s)
-    irr = xirr(cf)
-    net_qty = float(hold.loc[hold['Security']==s, 'NetQuantity'].values[0]) if (hold['Security']==s).any() else 0.0
-    last_px = txn[txn['Security']==s].sort_values('Date')['Price'].dropna().iloc[-1] if txn[txn['Security']==s]['Price'].notna().any() else np.nan
-    mv = net_qty * last_px if not pd.isna(last_px) else np.nan
-    rows.append({'Security': s, 'NetQuantity': net_qty, 'LastPrice': last_px, 'MarketValue': mv, 'XIRR': irr})
-
-xirr_df = pd.DataFrame(rows).sort_values(by=['MarketValue','Security'], ascending=[False, True])
-
-# Portfolio-level IRR
-portfolio_cf = build_cashflows(txn, None)
-port_irr = xirr(sorted(portfolio_cf, key=lambda x: x[0])) if len(portfolio_cf)>0 else np.nan
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Portfolio XIRR (annual)", f"{port_irr:.2%}" if not pd.isna(port_irr) else "N/A")
-with col2:
-    total_invested = -sum(a for _, a in portfolio_cf if a<0)
-    st.metric("Total Invested", f"₹{total_invested:,.0f}")
-with col3:
-    approx_mv = xirr_df['MarketValue'].sum(skipna=True)
-    st.metric("Approx. Market Value", f"₹{approx_mv:,.0f}" if not pd.isna(approx_mv) else "—")
-
-st.subheader("Holdings & XIRR")
-st.dataframe(xirr_df.style.format({'LastPrice':'{:.2f}','MarketValue':'{:.0f}','XIRR':'{:.2%}'}))
-
-# ---------------- Allocation ----------------
-st.subheader("Allocation Insights")
-
-# Asset/Sector/MCAP if available
-left, right = st.columns(2)
-with left:
-    if txn['Sector'].notna().any():
-        sec_mv = txn.assign(EstValue = np.where(txn['Price'].notna() & txn['Quantity'].notna(), txn['Price']*txn['Quantity'], txn['Amount'])) \
-                   .groupby('Sector', dropna=True)['EstValue'].sum().reset_index()
-        if len(sec_mv)>0:
-            fig = px.pie(sec_mv, names='Sector', values='EstValue', title='Allocation by Sector')
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Sector data not present.")
-    else:
-        st.info("No 'Sector' in file. You can add it as a column for richer allocation charts.")
-
-with right:
-    if txn['MarketCapCategory'].notna().any():
-        mcap = txn.assign(EstValue = np.where(txn['Price'].notna() & txn['Quantity'].notna(), txn['Price']*txn['Quantity'], txn['Amount'])) \
-                 .groupby('MarketCapCategory', dropna=True)['EstValue'].sum().reset_index()
-        if len(mcap)>0:
-            fig2 = px.bar(mcap, x='MarketCapCategory', y='EstValue', title='Allocation by Market Cap')
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Market-cap data not present.")
-    else:
-        st.info("No 'MarketCapCategory' in file.")
-
-# Concentration
-st.subheader("Concentration & Risk")
-# Weight by estimated MV (fallback to invested amount if price/qty missing)
-h_w = txn.assign(EstValue = np.where(txn['Price'].notna() & txn['Quantity'].notna(), txn['Price']*txn['Quantity'], txn['Amount'])) \
-        .groupby('Security')['EstValue'].sum() \
-        .pipe(lambda s: s/s.sum() if s.sum()!=0 else s)
-metrics = concentration_metrics(h_w)
-cc1, cc2, cc3 = st.columns(3)
-cc1.metric("HHI (0-1)", f"{metrics['HHI']:.3f}")
-cc2.metric("Top Holding Weight", f"{metrics['Top1']:.2%}")
-cc3.metric("Top 3 Weight", f"{metrics['Top3']:.2%}")
-
-st.caption("Lower HHI and balanced top weights indicate better diversification. As a rule of thumb, HHI < 0.15 is well-diversified.")
-
-# ---------------- Cashflows & P&L ----------------
-st.subheader("Cashflows & Realized P&L")
-cf_df = pd.DataFrame(portfolio_cf, columns=['Date','Amount']).sort_values('Date')
-cf_df['Cumulative'] = cf_df['Amount'].cumsum()
-st.area_chart(cf_df.set_index('Date')[['Amount']])
-st.line_chart(cf_df.set_index('Date')[['Cumulative']])
-
-# Realized P&L from SELL/REDEMPTION transactions only (approx; ignores fees/taxes)
-sell_mask = txn['Type'].str.contains('SELL|REDEMPTION|SWITCH OUT', na=False)
-realized = txn[sell_mask].groupby('Security')['Amount'].sum().sort_values(ascending=False).reset_index(name='RealizedProceeds')
-with st.expander("Realized Proceeds by Security"):
-    st.dataframe(realized)
-
-# ---------------- Performance vs Benchmarks ----------------
-st.subheader("Performance vs Benchmarks (Indexed)")
-if enable_online and YFINANCE_AVAILABLE:
-    start_date = pd.to_datetime(txn['Date']).min()
-    end_date = datetime.today().strftime('%Y-%m-%d')
-    tickers = {
-        'Nifty 50': benchmark_nifty,
-        'Nifty Next 50': benchmark_next50,
-        'Nifty Midcap': benchmark_mid,
-        'Nifty Smallcap': benchmark_small
-    }
-    bench = {}
-    for n, tk in tickers.items():
-        try:
-            ser = yf.download(tk, start=start_date, end=end_date, progress=False)['Adj Close']
-            if not ser.empty:
-                bench[n] = ser/ser.iloc[0]*100
+            return pd.to_datetime(x, format=fmt)
         except Exception:
-            pass
+            continue
+    return pd.to_datetime(x, errors="coerce")
 
-    # Approximate portfolio series: cumulative net value using transaction prices (best effort)
-    # If per-security symbols are NSE tickers, try to fetch and value daily; else fall back to cashflow cumulative proxy.
-    portfolio_ts = None
-    fetched_any = False
-    for s in txn['Security'].dropna().unique():
-        symbol = str(s)
-        if enable_online and ('.NS' in symbol or len(symbol)<=10):
-            try:
-                ser = yf.download(symbol, start=start_date, end=end_date, progress=False)['Adj Close']
-                qty = txn[txn['Security']==s]['Quantity'].sum()
-                if portfolio_ts is None:
-                    portfolio_ts = ser*0
-                portfolio_ts = portfolio_ts + ser*qty
-                fetched_any = True
-            except Exception:
-                continue
-    if not fetched_any or portfolio_ts is None or portfolio_ts.empty:
-        df_cash = cf_df.set_index('Date')['Amount'].groupby(pd.Grouper(freq='D')).sum().fillna(0).cumsum()
-        portfolio_ts = df_cash
 
-    fig = go.Figure()
-    try:
-        fig.add_trace(go.Scatter(x=portfolio_ts.index, y=portfolio_ts/portfolio_ts.iloc[0]*100, name='Portfolio (approx)'))
-    except Exception:
-        pass
-    for n, ser in bench.items():
-        fig.add_trace(go.Scatter(x=ser.index, y=ser.values, name=n))
-    fig.update_layout(yaxis_title='Indexed (100=Start)', xaxis_title='Date')
-    st.plotly_chart(fig, use_container_width=True)
+def load_file(upload):
+    """Load uploaded file into a canonical transactions DataFrame.
+    Accepts CSV/XLSX. Attempts PDF via pdfminer (best-effort).
+    Expected columns (case-insensitive, flexible names allowed):
+      - Date
+      - Scheme
+      - Transaction (Purchase/Sell/Dividend Reinvest/...)
+      - Amount (negative for redemptions if available; else we'll sign by type)
+      - Units
+      - NAV (optional)
+      - Sector (optional)
+      - MarketCap (Large/Mid/Small) (optional)
+      - CurrentValue (optional, for valuation snapshots)
+    """
+    name = upload.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(upload)
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(upload)
+    elif name.endswith(".pdf"):
+        try:
+            from pdfminer.high_level import extract_text
+            text = extract_text(upload)
+            # Very light-touch parsing: try to extract CSV-like rows using regex.
+            # Users should prefer CSV/XLSX for accuracy.
+            rows = []
+            for line in text.splitlines():
+                if re.search(r"\d{1,2}[-/][A-Za-z0-9]{3,9}[-/]\d{2,4}", line) or re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", line):
+                    parts = re.split(r"\s{2,}|\t|,", line.strip())
+                    if len(parts) >= 5:
+                        rows.append(parts[:12])
+            df = pd.DataFrame(rows)
+            df.columns = (SAMPLE_COLUMNS[: df.shape[1]])
+        except Exception:
+            st.error("PDF parsing is experimental. Please upload a CSV/XLSX per the template.")
+            return None
+    else:
+        st.error("Unsupported file type. Please upload CSV, XLSX, or PDF.")
+        return None
+
+    # Normalize columns
+    col_map = {}
+    for c in df.columns:
+        lc = c.strip().lower()
+        if lc in ["date", "txn date", "transaction date"]:
+            col_map[c] = "Date"
+        elif lc in ["scheme", "scheme name", "fund"]:
+            col_map[c] = "Scheme"
+        elif lc in ["transaction", "txn type", "type", "trans type"]:
+            col_map[c] = "Transaction"
+        elif lc in ["amount", "amount (inr)", "value"]:
+            col_map[c] = "Amount"
+        elif lc in ["units", "qty"]:
+            col_map[c] = "Units"
+        elif lc in ["nav", "price"]:
+            col_map[c] = "NAV"
+        elif lc in ["sector"]:
+            col_map[c] = "Sector"
+        elif lc in ["marketcap", "market cap", "cap"]:
+            col_map[c] = "MarketCap"
+        elif lc in ["currentvalue", "current value", "valuation", "market value"]:
+            col_map[c] = "CurrentValue"
+        elif lc in ["isin"]:
+            col_map[c] = "ISIN"
+        elif lc in ["amc", "rta"]:
+            col_map[c] = "AMC"
+        else:
+            col_map[c] = c
+    df = df.rename(columns=col_map)
+
+    # Basic cleaning
+    if "Date" not in df.columns or "Scheme" not in df.columns:
+        st.error("Missing essential columns (Date, Scheme). Please use the template.")
+        return None
+
+    df["Date"] = df["Date"].apply(_to_date)
+    df = df.dropna(subset=["Date", "Scheme"]).copy()
+
+    if "Transaction" not in df.columns:
+        df["Transaction"] = "Purchase"
+
+    # Compute signed Amount if not present
+    if "Amount" in df.columns:
+        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+        # If redemptions are positive, flip sign for sell
+        mask_sell = df["Transaction"].str.contains("sell|redeem", case=False, na=False)
+        df.loc[mask_sell & (df["Amount"] > 0), "Amount"] *= -1
+    else:
+        df["Amount"] = 0.0
+
+    # Units numeric
+    if "Units" in df.columns:
+        df["Units"] = pd.to_numeric(df["Units"], errors="coerce").fillna(0.0)
+    else:
+        df["Units"] = np.nan
+
+    if "NAV" in df.columns:
+        df["NAV"] = pd.to_numeric(df["NAV"], errors="coerce")
+
+    # Fill optional columns
+    for opt in ["Sector", "MarketCap", "CurrentValue", "AMC", "ISIN"]:
+        if opt not in df.columns:
+            df[opt] = np.nan
+    df["CurrentValue"] = pd.to_numeric(df["CurrentValue"], errors="coerce")
+
+    df = df.sort_values("Date").reset_index(drop=True)
+    return df
+
+
+# -----------------------
+# Finance math helpers
+# -----------------------
+
+def xnpv(rate, dates, cashflows):
+    t0 = pd.to_datetime(dates).min()
+    return sum(cf / (1 + rate) ** ((pd.to_datetime(d) - t0).days / 365.0) for cf, d in zip(cashflows, dates))
+
+
+def xirr(dates, cashflows, guess=0.1):
+    # Robust XIRR using bisection around a wide bracket
+    dates = list(pd.to_datetime(dates))
+    cashflows = list(map(float, cashflows))
+    if abs(sum(cashflows)) < 1e-6:
+        return 0.0
+    low, high = -0.9999, 5.0
+    for _ in range(200):
+        mid = (low + high) / 2
+        val = xnpv(mid, dates, cashflows)
+        if abs(val) < 1e-7:
+            return mid
+        val_low = xnpv(low, dates, cashflows)
+        if val_low * val < 0:
+            high = mid
+        else:
+            low = mid
+    return mid
+
+
+def month_end(d):
+    d = pd.to_datetime(d)
+    return (d + pd.offsets.MonthEnd(0)).date()
+
+
+# -----------------------
+# Benchmark data
+# -----------------------
+BENCH_CONFIG = {
+    "NIFTY 500": {
+        "tickers": ["NIFTYBEES.NS"],  # proxy if NIFTY 500 NSE index not available; will fallback
+    },
+    "NIFTY 50": {
+        "tickers": ["NIFTYBEES.NS"],
+    },
+    "NIFTY MIDCAP": {
+        "tickers": ["NIFTYMID150.NS", "MIDCAPETF.NS", "ICICIM150.NS"],
+    },
+    "NIFTY SMALL": {
+        "tickers": ["SMALLCAP.NS", "NISMALLCAP.NS", "MOTISLMS.NS"],
+    },
+}
+
+@st.cache_data(show_spinner=False)
+def fetch_benchmark_series(label: str, start: date, end: date) -> pd.Series:
+    """Fetch monthly total-return-like proxy using closing prices.
+    Prefers ETFs on Yahoo Finance. Falls back to synthetic series if offline.
+    Returns a monthly series indexed by month-end with normalized starting value 100.
+    """
+    idx = pd.date_range(start, end, freq="M")
+    if yf is None:
+        # Offline fallback: 10% annual drift w/ noise
+        rng = np.random.default_rng(42)
+        rets = rng.normal(loc=(0.10/12), scale=0.04, size=len(idx))
+        series = pd.Series(100 * (1 + pd.Series(rets)).cumprod(), index=idx)
+        series.name = label
+        return series
+
+    tickers = BENCH_CONFIG.get(label, {}).get("tickers", [])
+    for tkr in tickers:
+        try:
+            data = yf.download(tkr, start=start - relativedelta(months=2), end=end + relativedelta(days=3), progress=False, auto_adjust=True)
+            if not data.empty:
+                monthly = data["Close"].resample("M").last().dropna()
+                series = 100 * (monthly / monthly.iloc[0])
+                series.name = label
+                return series.loc[idx.intersection(series.index)]
+        except Exception:
+            continue
+    # final fallback synthetic
+    rng = np.random.default_rng(7)
+    rets = rng.normal(loc=(0.11/12), scale=0.05, size=len(idx))
+    series = pd.Series(100 * (1 + pd.Series(rets)).cumprod(), index=idx)
+    series.name = label
+    return series
+
+
+# -----------------------
+# Portfolio engine
+# -----------------------
+
+def build_cashflows(df: pd.DataFrame, valuation_date: date, cur_value_by_scheme: dict | None = None):
+    """Build cashflows per scheme and in total. Dividend reinvest is treated as no external cashflow (amount=0).
+    Redemptions are positive cashflows (money back), Purchases are negatives.
+    Adds terminal positive cashflow for current value at valuation_date.
+    Returns dict: {scheme: DataFrame[Date, Cashflow]}
+    """
+    cf = {}
+    for scheme, d in df.groupby("Scheme"):
+        dd = d.copy()
+        cash = []
+        for _, r in dd.iterrows():
+            typ = str(r.get("Transaction", "")).lower()
+            amt = float(r.get("Amount", 0) or 0)
+            if "purchase" in typ or "buy" in typ:
+                cash.append((r["Date"], -abs(amt)))
+            elif "sell" in typ or "redeem" in typ:
+                cash.append((r["Date"], abs(amt)))
+            elif "dividend" in typ and "reinvest" in typ:
+                # internal reinvestment
+                cash.append((r["Date"], 0.0))
+            else:
+                cash.append((r["Date"], amt))
+        # terminal value
+        term_val = None
+        if cur_value_by_scheme and scheme in cur_value_by_scheme:
+            term_val = float(cur_value_by_scheme[scheme])
+        elif "CurrentValue" in dd.columns and dd["CurrentValue"].notna().any():
+            term_val = float(dd["CurrentValue"].dropna().iloc[-1])
+        if term_val is not None and term_val != 0:
+            cash.append((pd.to_datetime(valuation_date), abs(term_val)))
+        cf[scheme] = pd.DataFrame(cash, columns=["Date", "Cashflow"]).sort_values("Date")
+    # total
+    all_cash = pd.concat(list(cf.values())).groupby("Date", as_index=False)["Cashflow"].sum()
+    cf["__TOTAL__"] = all_cash
+    return cf
+
+
+def portfolio_monthly_series(df: pd.DataFrame, valuation_date: date):
+    """Build monthly series for invested (cumulative net contributions) and portfolio value.
+    If CurrentValue not provided monthly, we approximate by carrying forward last known.
+    """
+    all_dates = pd.date_range(df["Date"].min(), valuation_date, freq="M")
+    tx = df.copy()
+    # external cashflows only
+    m = tx["Transaction"].str.lower().fillna("")
+    ext = tx[(m.str.contains("purchase|buy|sell|redeem"))].copy()
+    ext.loc[m.str.contains("purchase|buy"), "SignedAmount"] = -ext.loc[m.str.contains("purchase|buy"), "Amount"].abs()
+    ext.loc[m.str.contains("sell|redeem"), "SignedAmount"] = ext.loc[m.str.contains("sell|redeem"), "Amount"].abs()
+    monthly_cf = ext.groupby(pd.Grouper(key="Date", freq="M"))["SignedAmount"].sum().reindex(all_dates, fill_value=0)
+
+    # Portfolio value approximation
+    if "CurrentValue" in df.columns and df["CurrentValue"].notna().any():
+        latest_by_scheme = df.sort_values("Date").groupby("Scheme")["CurrentValue"].last()
+        port_val = latest_by_scheme.sum()
+        value_series = pd.Series(port_val, index=all_dates)
+    else:
+        # If units & nav available, last known NAV*units per scheme
+        if {"Units", "NAV"}.issubset(df.columns):
+            last_units = df.sort_values("Date").groupby("Scheme")["Units"].sum()
+            last_nav = df.sort_values("Date").groupby("Scheme")["NAV"].last().fillna(0)
+            est_val = float((last_units * last_nav).sum())
+            value_series = pd.Series(est_val, index=all_dates)
+        else:
+            value_series = pd.Series(0.0, index=all_dates)
+
+    invested_series = -monthly_cf.cumsum()
+    return invested_series.rename("Invested"), value_series.rename("Portfolio")
+
+
+def simulate_benchmark_from_cashflows(cashflow_df: pd.DataFrame, bench_series: pd.Series):
+    """Given dated cashflows (negative invest, positive redeem) and a benchmark index series (value=100 base),
+    simulate investing those cashflows into the benchmark and compute terminal value and XIRR.
+    """
+    # align to month end
+    cf = cashflow_df.copy()
+    cf["Date"] = cf["Date"].apply(month_end)
+    bench = bench_series.copy()
+    bench = bench / bench.iloc[0]
+
+    units = 0.0
+    last_idx = None
+    for d, amt in zip(cf["Date"], cf["Cashflow"]):
+        if d not in bench.index:
+            continue
+        px = bench.loc[d]
+        if amt < 0:  # investment
+            units += (-amt) / px
+        else:  # redemption
+            units -= amt / px
+        last_idx = d
+    terminal_value = units * bench.iloc[-1]
+
+    # Build CFs for XIRR: use same CFs plus terminal value
+    xirr_dates = list(cf["Date"]) + [bench.index[-1]]
+    xirr_cfs = list(cf["Cashflow"]) + [terminal_value]
+    rate = xirr(xirr_dates, xirr_cfs)
+    return terminal_value, rate
+
+
+# -----------------------
+# UI — Sidebar
+# -----------------------
+st.sidebar.markdown(
+    f"""
+    <div style='padding:12px;border-radius:16px;background:{SOFT_BLUE};border:1px solid {PRIMARY_BLUE}'>
+        <h3 style='margin:0;color:{PRIMARY_BLUE}'>3Sigma Partners</h3>
+        <p style='margin:4px 0;color:{MID_GREY}'>CAS Portfolio Analytics</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+uploaded = st.sidebar.file_uploader("Upload CAS (CSV/XLSX/PDF). Need help? Download the template below.", type=["csv", "xlsx", "xls", "pdf"])
+colA, colB = st.sidebar.columns([1,1])
+with colA:
+    if st.button("Download CSV Template"):
+        buf = io.StringIO()
+        pd.DataFrame(SAMPLE_ROWS, columns=SAMPLE_COLUMNS).to_csv(buf, index=False)
+        st.download_button(
+            label="Save Template",
+            data=buf.getvalue(),
+            file_name="cas_template_3sigma.csv",
+            mime="text/csv",
+        )
+with colB:
+    demo = st.toggle("Use Demo Data", value=False, help="Generate a small synthetic dataset if no file is uploaded.")
+
+valuation_date = st.sidebar.date_input("Valuation Date", value=date.today())
+default_bench = st.sidebar.selectbox("Default Benchmark", ["NIFTY 500", "NIFTY 50", "NIFTY MIDCAP", "NIFTY SMALL"], index=0)
+
+# -----------------------
+# Data Loading
+# -----------------------
+if uploaded is not None:
+    data = load_file(uploaded)
 else:
-    st.info("Online price fetch disabled or yfinance not available. Enable it in the sidebar to see benchmark charts.")
+    data = None
 
-# Drawdowns (on portfolio_ts if available)
-if 'fig' in locals():
-    try:
-        # Reconstruct portfolio series from plotted data if needed
-        port_series = portfolio_ts
-        dd = drawdown(pd.Series(port_series))
-        figdd = go.Figure()
-        figdd.add_trace(go.Scatter(x=dd.index, y=dd['drawdown'], name='Drawdown'))
-        figdd.update_layout(yaxis_tickformat=",.0%", title='Portfolio Drawdown', xaxis_title='Date')
-        st.plotly_chart(figdd, use_container_width=True)
-    except Exception:
-        pass
+if data is None and demo:
+    data = pd.DataFrame(SAMPLE_ROWS, columns=SAMPLE_COLUMNS)
 
-# ---------------- Export ----------------
-st.subheader("Export Reports")
+if data is None:
+    st.info("Upload a CAS file or enable Demo Data to explore the dashboard.")
+    st.stop()
 
-def excel_bytes():
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        # Summary sheet
-        pd.DataFrame([
-            {'GeneratedOn': datetime.now(), 'PortfolioXIRR': port_irr, 'TotalInvested': total_invested, 'ApproxMarketValue': approx_mv}
-        ]).to_excel(writer, sheet_name='Summary', index=False)
-        txn.to_excel(writer, sheet_name='Transactions', index=False)
-        xirr_df.to_excel(writer, sheet_name='Holdings_XIRR', index=False)
-    return output.getvalue()
+# Filters
+mind = pd.to_datetime(data["Date"]).min().date()
+maxd = pd.to_datetime(data["Date"]).max().date()
+start_date, end_date = st.sidebar.date_input("Filter Date Range", value=(mind, valuation_date), min_value=mind, max_value=valuation_date)
 
-st.download_button(f"Download Excel Summary ({BRAND})", excel_bytes(), file_name=f"{BRAND.replace(' ','_')}_summary.xlsx")
+flt = (data["Date"] >= pd.to_datetime(start_date)) & (data["Date"] <= pd.to_datetime(end_date))
+data = data.loc[flt].copy()
 
+# -----------------------
+# Engine: Cashflows & Benchmarks
+# -----------------------
+cf_by = build_cashflows(data, valuation_date)
+monthly_invested, monthly_value = portfolio_monthly_series(data, valuation_date)
+start_for_bench = min(monthly_invested.index.min(), pd.to_datetime(start_date))
+end_for_bench = pd.to_datetime(valuation_date)
 
-def pdf_bytes(include_charts=True):
-    buf = io.BytesIO()
-    with PdfPages(buf) as pdf:
-        # Cover
-        fig = plt.figure(figsize=(8.27, 11.69))  # A4
-        ax = fig.add_subplot(1,1,1)
-        ax.axis('off')
-        ax.text(0.5, 0.8, BRAND, fontsize=28, ha='center')
-        ax.text(0.5, 0.74, 'Portfolio Review', fontsize=18, ha='center')
-        ax.text(0.5, 0.68, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", ha='center')
-        if meta.get('investor'):
-            inv = meta['investor']
-            ax.text(0.5, 0.62, f"Investor: {inv.get('name','')}", ha='center')
-        if advisor_notes:
-            ax.text(0.5, 0.56, "Advisor Notes:", fontsize=12, ha='center')
-            ax.text(0.5, 0.52, advisor_notes[:3000], wrap=True, ha='center')
-        pdf.savefig(fig); plt.close(fig)
+bench_series_cache = {name: fetch_benchmark_series(name, start_for_bench.date(), end_for_bench.date()) for name in BENCH_CONFIG.keys()}
 
-        # Holdings table
-        fig, ax = plt.subplots(figsize=(8.27, 11.69))
-        ax.axis('off')
-        ax.set_title('Holdings & XIRR')
-        tdf = xirr_df.copy()
-        tdf['XIRR'] = tdf['XIRR'].apply(lambda x: f"{x:.2%}" if not pd.isna(x) else 'N/A')
-        show = tdf[['Security','NetQuantity','LastPrice','MarketValue','XIRR']].head(45)
-        ax.table(cellText=show.values, colLabels=show.columns, loc='center')
-        pdf.savefig(fig); plt.close(fig)
+# Total XIRR & Benchmark XIRR (NIFTY 500)
+port_cf = cf_by["__TOTAL__"]
+term_val, bench_total_xirr = simulate_benchmark_from_cashflows(port_cf, bench_series_cache["NIFTY 500"])  # as requested, compare XIRR vs NIFTY 500
 
-        # Optional charts (benchmarks)
-        if include_charts and enable_online and YFINANCE_AVAILABLE:
-            try:
-                # Simple Nifty 50 panel
-                start_date = pd.to_datetime(txn['Date']).min()
-                end_date = datetime.today().strftime('%Y-%m-%d')
-                ser = yf.download(benchmark_nifty, start=start_date, end=end_date, progress=False)['Adj Close']
-                fig = plt.figure(figsize=(8.27, 4))
-                plt.plot(ser.index, ser.values)
-                plt.title('Nifty 50 (Adj Close)')
-                pdf.savefig(fig); plt.close(fig)
-            except Exception:
-                pass
-    buf.seek(0)
-    return buf.read()
+port_dates = list(port_cf["Date"]) + [pd.to_datetime(valuation_date)]
+port_cfs = list(port_cf["Cashflow"]) + [monthly_value.iloc[-1] if len(monthly_value)>0 else 0.0]
+portfolio_xirr = xirr(port_dates, port_cfs)
 
-st.download_button(f"Download PDF Report ({BRAND})", pdf_bytes(include_charts=include_price_charts), file_name=f"{BRAND.replace(' ','_')}_report.pdf", mime='application/pdf')
+# -----------------------
+# Header KPIs
+# -----------------------
+top1, top2, top3, top4 = st.columns(4)
+with top1:
+    invested_total = (-port_cf["Cashflow"].clip(upper=0).sum())
+    st.metric("Total Invested", f"₹{invested_total:,.0f}")
+with top2:
+    port_val = float(monthly_value.iloc[-1]) if len(monthly_value) else 0.0
+    st.metric("Portfolio Value", f"₹{port_val:,.0f}")
+with top3:
+    pnl = port_val - invested_total
+    st.metric("Unrealized P&L", f"₹{pnl:,.0f}", delta=f"{(pnl/max(invested_total,1))*100:,.2f}%")
+with top4:
+    st.metric("Total XIRR", f"{portfolio_xirr*100:,.2f}%", delta=f"vs NIFTY 500: {(portfolio_xirr-bench_total_xirr)*100:,.2f}%")
 
 st.markdown("---")
-st.caption(f"{BRAND} — Advisory dashboard. Best-effort parsing for CAS/CSV/XLSX. For bespoke mapping (sector, market-cap, tickers), upload a sample and we will tailor the parser.")
+
+# -----------------------
+# Tabs
+# -----------------------
+(
+    tab_overview,
+    tab_performance,
+    tab_allocation,
+    tab_risk,
+    tab_transactions,
+    tab_diagnostics,
+) = st.tabs([
+    "Overview",
+    "Performance",
+    "Allocations",
+    "Risk",
+    "Transactions",
+    "Diagnostics",
+])
+
+# -----------------------
+# Overview Tab
+# -----------------------
+with tab_overview:
+    st.subheader("Portfolio vs Benchmarks")
+
+    bench_choice = st.selectbox("Benchmark for overlay", list(BENCH_CONFIG.keys()), index=list(BENCH_CONFIG.keys()).index(default_bench))
+    bench_series = bench_series_cache[bench_choice]
+
+    # Build benchmark value using same monthly contributions
+    bench_val, bench_x = simulate_benchmark_from_cashflows(port_cf, bench_series)
+
+    # Build series for plotting: monthly invested, portfolio value, benchmark value
+    idx = monthly_invested.index
+    bench_norm = bench_series / bench_series.iloc[0]
+
+    # simulate value curve month by month
+    cf_m = port_cf.copy()
+    cf_m["Date"] = cf_m["Date"].apply(month_end)
+    contrib = cf_m.groupby("Date")["Cashflow"].sum().reindex(idx, fill_value=0)
+
+    # Portfolio series already available (monthly_value)
+    # Benchmark value series simulation
+    units = 0.0
+    bvals = []
+    for d in idx:
+        px = bench_norm.loc[bench_norm.index.get_indexer([d], method='nearest')[0]] if d in bench_norm.index else (bench_norm.iloc[-1] if len(bench_norm)>0 else 1)
+        c = contrib.loc[d]
+        if c < 0:  # invest
+            units += (-c) / px
+        else:      # redeem
+            units -= c / px
+        bvals.append(units * px)
+    bench_curve = pd.Series(bvals, index=idx, name=f"Benchmark Sim ({bench_choice})")
+
+    df_plot = pd.DataFrame({
+        "Invested": monthly_invested,
+        "Portfolio": monthly_value,
+        f"Benchmark Sim ({bench_choice})": bench_curve * (monthly_invested.iloc[0]*0 + 100000)  # scale similar to rupees for readability
+    })
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot["Invested"], mode='lines', name='Invested', line=dict(color=COLOR_SETS["line"][2], width=2)))
+    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot["Portfolio"], mode='lines', name='Portfolio Value', line=dict(color=COLOR_SETS["line"][0], width=3)))
+    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot.iloc[:,2], mode='lines', name=df_plot.columns[2], line=dict(color=COLOR_SETS["line"][1], width=2, dash='dash')))
+    fig.update_layout(
+        height=480,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor=LIGHT_GREY,
+        paper_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption("Line chart shows monthly invested amount (cumulative), estimated portfolio value, and simulated benchmark value using identical cashflows.")
+
+# -----------------------
+# Performance Tab
+# -----------------------
+with tab_performance:
+    st.subheader("XIRR by Investment vs NIFTY 500 XIRR")
+
+    rows = []
+    for scheme, cf in cf_by.items():
+        if scheme == "__TOTAL__":
+            continue
+        # Scheme XIRR
+        dts = list(cf["Date"]) + [pd.to_datetime(valuation_date)]
+        # terminal: approximate with last known CurrentValue per scheme if present
+        term = data.loc[data["Scheme"]==scheme, "CurrentValue"].dropna()
+        terminal = float(term.iloc[-1]) if len(term)>0 else 0.0
+        cfs = list(cf["Cashflow"]) + [terminal]
+        r = xirr(dts, cfs)
+
+        # Benchmark XIRR (NIFTY 500) for the same cashflows
+        _, r_bench = simulate_benchmark_from_cashflows(cf, bench_series_cache["NIFTY 500"])  # as requested
+        rows.append({"Scheme": scheme, "XIRR": r*100, "NIFTY 500 XIRR": r_bench*100, "Alpha (pp)": (r - r_bench)*100})
+
+    xirr_df = pd.DataFrame(rows).sort_values("Alpha (pp)", ascending=False)
+    st.dataframe(xirr_df, use_container_width=True)
+
+    st.markdown("### Index Returns Snapshot (since your first transaction)")
+    first_dt = pd.to_datetime(data["Date"]).min().date()
+    idx_cols = []
+    for name, ser in bench_series_cache.items():
+        ret = (ser.iloc[-1] / ser.iloc[0] - 1) * 100
+        idx_cols.append({"Index": name, "Return %": round(ret,2)})
+    idx_df = pd.DataFrame(idx_cols).sort_values("Index")
+    c1, c2 = st.columns([2,1])
+    with c1:
+        st.dataframe(idx_df, use_container_width=True)
+    with c2:
+        figb = px.bar(idx_df, x="Index", y="Return %", color="Index", color_discrete_sequence=COLOR_SETS["bars"])
+        figb.update_layout(showlegend=False, height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor=GOLD_SOFT)
+        st.plotly_chart(figb, use_container_width=True)
+
+# -----------------------
+# Allocations Tab
+# -----------------------
+with tab_allocation:
+    st.subheader("Allocation Views")
+    # Market Cap
+    if "MarketCap" in data.columns and data["MarketCap"].notna().any():
+        mk_df = data.sort_values("Date").groupby(["Scheme","MarketCap"])  \
+            .agg({"Units":"sum","CurrentValue":"last"}).reset_index()
+        mk_df["Weight"] = mk_df["CurrentValue"].fillna(0)
+        pie1 = px.pie(mk_df.groupby("MarketCap")["Weight"].sum().reset_index(), names="MarketCap", values="Weight",
+                      color="MarketCap", color_discrete_sequence=COLOR_SETS["pie"], hole=0.45)
+        pie1.update_layout(height=380, title_text="Market-Cap Allocation", title_x=0.5)
+        st.plotly_chart(pie1, use_container_width=True)
+    else:
+        st.info("MarketCap column not found. Populate Large/Mid/Small to enable this view.")
+
+    # Sector
+    if "Sector" in data.columns and data["Sector"].notna().any():
+        sec_df = data.sort_values("Date").groupby(["Scheme","Sector"]).agg({"CurrentValue":"last"}).reset_index()
+        sec_bar = px.bar(sec_df.groupby("Sector")["CurrentValue"].sum().sort_values(ascending=False).reset_index(),
+                         x="Sector", y="CurrentValue", color="Sector", color_discrete_sequence=COLOR_SETS["bars"]) \
+                    .update_layout(height=420, title_text="Sector Allocation", title_x=0.5, showlegend=False)
+        st.plotly_chart(sec_bar, use_container_width=True)
+    else:
+        st.info("Sector column not found. Add sector tags for better insights.")
+
+    # AMC exposure
+    if "AMC" in data.columns and data["AMC"].notna().any():
+        amc_df = data.sort_values("Date").groupby("AMC").agg({"CurrentValue":"last"}).reset_index()
+        amc_df = amc_df.sort_values("CurrentValue", ascending=False).head(15)
+        amc_bar = px.bar(amc_df, x="AMC", y="CurrentValue", color="AMC", color_discrete_sequence=COLOR_SETS["bars"]).update_layout(showlegend=False, height=360, title_text="AMC Exposure", title_x=0.5)
+        st.plotly_chart(amc_bar, use_container_width=True)
+
+# -----------------------
+# Risk Tab
+# -----------------------
+with tab_risk:
+    st.subheader("Risk & Drawdowns (Portfolio Approx)")
+
+    # Approximate portfolio NAV series from monthly_value
+    nav = monthly_value.replace(0, np.nan).ffill()
+    ret = nav.pct_change().dropna()
+    if len(ret) > 3:
+        vol = ret.std() * math.sqrt(12)
+        dd = (nav / nav.cummax() - 1).min()
+        st.metric("Annualized Volatility", f"{vol*100:,.2f}%")
+        st.metric("Max Drawdown", f"{dd*100:,.2f}%")
+
+        # Drawdown curve
+        dd_series = nav / nav.cummax() - 1
+        figdd = go.Figure()
+        figdd.add_trace(go.Scatter(x=dd_series.index, y=dd_series.values, mode='lines', name='Drawdown', line=dict(color=GOLD)))
+        figdd.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10), yaxis_tickformat=",.0%", plot_bgcolor=LIGHT_GREY)
+        st.plotly_chart(figdd, use_container_width=True)
+
+        # Beta vs selected benchmark
+        bench_for_beta = st.selectbox("Benchmark for Beta", list(BENCH_CONFIG.keys()), index=0)
+        bser = bench_series_cache[bench_for_beta]
+        bret = bser.pct_change().dropna()
+        # align
+        dfb = pd.DataFrame({"p": ret, "b": bret}).dropna()
+        if len(dfb) > 3:
+            cov = np.cov(dfb["p"], dfb["b"])[0,1]
+            beta = cov / np.var(dfb["b"]) if np.var(dfb["b"])>0 else np.nan
+            st.metric("Beta (monthly)", f"{beta:,.2f}")
+
+            sc = px.scatter(dfb, x="b", y="p", trendline="ols", labels={"b":"Benchmark Returns", "p":"Portfolio Returns"}, color_discrete_sequence=[PRIMARY_BLUE])
+            sc.update_layout(height=360, plot_bgcolor=SOFT_BLUE)
+            st.plotly_chart(sc, use_container_width=True)
+    else:
+        st.info("Not enough history to compute risk stats.")
+
+# -----------------------
+# Transactions Tab
+# -----------------------
+with tab_transactions:
+    st.subheader("Transaction Ledger")
+    show_cols = [c for c in ["Date","Scheme","Transaction","Amount","Units","NAV","Sector","MarketCap","AMC","CurrentValue"] if c in data.columns]
+    st.dataframe(data[show_cols].sort_values("Date"), use_container_width=True)
+
+    st.markdown("### Monthly Cashflow Heatmap")
+    d = data.copy()
+    d["Signed"] = 0.0
+    m = d["Transaction"].str.lower().fillna("")
+    d.loc[m.str.contains("purchase|buy"), "Signed"] = -d.loc[m.str.contains("purchase|buy"), "Amount"].abs()
+    d.loc[m.str.contains("sell|redeem"), "Signed"] = d.loc[m.str.contains("sell|redeem"), "Amount"].abs()
+    d["Year"] = d["Date"].dt.year
+    d["Month"] = d["Date"].dt.month_name().str[:3]
+    piv = d.pivot_table(index="Year", columns="Month", values="Signed", aggfunc="sum").fillna(0)
+    heat = go.Figure(data=go.Heatmap(z=piv.values, x=piv.columns, y=piv.index, colorscale=[[0, LIGHT_GREY],[1, PRIMARY_BLUE]]))
+    heat.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(heat, use_container_width=True)
+
+# -----------------------
+# Diagnostics Tab
+# -----------------------
+with tab_diagnostics:
+    st.subheader("Data Quality & Notes")
+    issues = []
+    if data["Amount"].abs().sum() == 0:
+        issues.append("Amounts look zero — ensure Amount column is present (positive for sells, negative or positive for buys; we will sign by type).")
+    if data["Units"].fillna(0).sum() == 0:
+        issues.append("Units missing — NAV-based valuation may be limited.")
+    if not data["CurrentValue"].notna().any():
+        issues.append("No CurrentValue provided — portfolio value is approximated. Add CurrentValue per scheme for precise XIRR.")
+    if len(issues)==0:
+        st.success("No major issues detected. You're good to go ✨")
+    else:
+        for msg in issues:
+            st.warning(msg)
+
+    st.markdown(
+        f"""
+        **Tips**
+        - To enable *MarketCap* and *Sector* allocations, populate those columns in your upload.
+        - XIRR comparisons are shown **vs NIFTY 500 XIRR** (as requested) in the Performance tab.
+        - Benchmark prices are fetched via Yahoo Finance ETF proxies when available; otherwise a synthetic fallback is used.
+        - For the cleanest results, upload CSV/XLSX using the provided template.
+        """
+    )
+
+# -----------------------
+# Footer
+# -----------------------
+st.markdown(
+    f"""
+    <div style='margin-top:24px;padding:14px;border-radius:18px;background:{SOFT_BLUE};border:1px solid {PRIMARY_BLUE}'>
+        <div style='display:flex;justify-content:space-between;align-items:center;'>
+            <div>
+                <strong style='color:{PRIMARY_BLUE}'>3Sigma Partners</strong><br/>
+                <span style='color:{MID_GREY}'>Wealth Advisory • Portfolio Analytics</span>
+            </div>
+            <div style='text-align:right;color:{MID_GREY}'>
+                Need a white-label deployment? Contact Us
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
